@@ -10,7 +10,7 @@ const DELAY_MIN_MS = 3000;
 const DELAY_MAX_MS = 6000;
 const COLUNA_PADRAO = 'A';
 const MAX_RETRIES = 3;
-const TIMEOUT_CONEXAO = 60;
+const TIMEOUT_QR_MINUTOS = 5; // Tempo máximo para escanear QR Code
 // ============================================
 
 const ARQUIVO_EXCEL = process.argv[2];
@@ -42,7 +42,8 @@ if (!ARQUIVO_EXCEL) {
 
 async function iniciar() {
     console.log(`📂 Arquivo: ${path.basename(ARQUIVO_EXCEL)}`);
-    console.log(`⏱️  Delay: ${DELAY_MIN_MS / 1000}s a ${DELAY_MAX_MS / 1000}s\n`);
+    console.log(`⏱️  Delay: ${DELAY_MIN_MS / 1000}s a ${DELAY_MAX_MS / 1000}s`);
+    console.log(`⏰ Timeout QR: ${TIMEOUT_QR_MINUTOS} minutos\n`);
     console.log('🚀 Conectando...\n');
 
     const client = new Client({
@@ -54,21 +55,29 @@ async function iniciar() {
     });
 
     let conectado = false;
+    let qrExibido = false;
+    let autenticado = false;
 
     client.on('qr', (qr) => {
-        console.log('📱 Escaneie o QR Code:\n');
+        qrExibido = true;
+        console.log(`\n📱 Escaneie o QR Code (você tem ${TIMEOUT_QR_MINUTOS} minutos):\n`);
         require('qrcode-terminal').generate(qr, { small: true });
+        console.log('\n⏳ Aguardando leitura do QR Code...');
     });
 
     client.on('loading_screen', (percent) => {
         process.stdout.write(`\r⏳ Carregando: ${percent}%   `);
     });
 
-    client.on('authenticated', () => console.log('\n🔐 Autenticado!'));
+    client.on('authenticated', () => {
+        autenticado = true;
+        console.log('\n🔐 Autenticado!');
+    });
 
     client.on('ready', async () => {
+        if (conectado) return; // Evita executar duas vezes
         conectado = true;
-        console.log('✅ Conectado!\n');
+        console.log('\n✅ Conectado!\n');
         await executarVerificacao(client);
     });
 
@@ -78,21 +87,30 @@ async function iniciar() {
 
     try {
         await client.initialize();
+
+        // Fallback: se autenticou mas o ready não disparou após 30s, tenta executar
+        setTimeout(async () => {
+            if (autenticado && !conectado) {
+                console.log('\n⚠️ Evento ready não disparou, tentando executar...');
+                conectado = true;
+                await executarVerificacao(client);
+            }
+        }, 30000);
+
     } catch (err) {
         console.error('❌ Erro:', err.message);
+        aguardarTecla();
     }
 
-    // Timeout
+    // Timeout apenas para QR Code - dá tempo para escanear
     setTimeout(async () => {
-        if (!conectado) {
-            console.log('\n⏰ Timeout - tentando forçar...');
-            try {
-                await executarVerificacao(client);
-            } catch (e) {
-                console.log('❌ Falhou:', e.message);
-            }
+        if (!conectado && qrExibido) {
+            console.log(`\n⏰ Tempo esgotado (${TIMEOUT_QR_MINUTOS} minutos).`);
+            console.log('   Reinicie o script para tentar novamente.');
+            try { await client.destroy(); } catch (e) { }
+            aguardarTecla();
         }
-    }, TIMEOUT_CONEXAO * 1000);
+    }, TIMEOUT_QR_MINUTOS * 60 * 1000);
 }
 
 async function executarVerificacao(client) {
@@ -151,19 +169,33 @@ async function verificarLista(client) {
         const numero = numeros[i];
         const prog = `[${String(i + 1).padStart(5)}/${numeros.length}]`;
 
-        const resultado = await verificarNumero(client, numero);
+        try {
+            const resultado = await verificarNumero(client, numero);
 
-        if (resultado.existe === true) {
-            existem++;
-            console.log(`${prog} ✅ ${numero}${resultado.nome ? ' (' + resultado.nome + ')' : ''}`);
-            resultados.push({ numero, existe: 'SIM', nome: resultado.nome });
-        } else if (resultado.existe === false) {
-            naoExistem++;
-            console.log(`${prog} ❌ ${numero}`);
-            resultados.push({ numero, existe: 'NÃO', nome: '' });
-        } else {
+            if (resultado.existe === true) {
+                existem++;
+                console.log(`${prog} ✅ ${numero}${resultado.nome ? ' (' + resultado.nome + ')' : ''}`);
+                resultados.push({ numero, existe: 'SIM', nome: resultado.nome });
+            } else if (resultado.existe === false) {
+                naoExistem++;
+                console.log(`${prog} ❌ ${numero}`);
+                resultados.push({ numero, existe: 'NÃO', nome: '' });
+            } else {
+                erros++;
+                console.log(`${prog} ⚠️  ${numero}`);
+                resultados.push({ numero, existe: 'ERRO', nome: '' });
+            }
+        } catch (error) {
+            // Captura erro de binding ou outros erros críticos
+            if (error.message && error.message.includes('already exists')) {
+                console.log(`\n⚠️  Erro de sessão no número ${i + 1}. Salvando progresso...`);
+                salvarResultado(resultados, '_resultado');
+                console.log(`💾 Progresso salvo! Reinicie o script para continuar.`);
+                console.log(`   Os números já verificados estão no arquivo _resultado.xlsx`);
+                throw error; // Re-lança para encerrar
+            }
             erros++;
-            console.log(`${prog} ⚠️  ${numero}`);
+            console.log(`${prog} ⚠️  ${numero} (erro)`);
             resultados.push({ numero, existe: 'ERRO', nome: '' });
         }
 
